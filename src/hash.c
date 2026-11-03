@@ -46,24 +46,78 @@ struct hash_entry {
 	int original_index;          // index into cracked_hashes[] this came from
 };
 
-// TODO (Person B): build this once, right after cracked_hashes[] is loaded.
-//      - convert each cracked_hashes[i].hash (hex string) into raw bytes
-//      - store it alongside i as the original_index
-//      - sort the array (e.g. qsort with a byte-array comparator) for
-//        binary search, OR build a simple hash table keyed on the bytes —
-//        your call, binary search is simpler to get right first
-struct hash_entry *build_lookup_structure(struct cracked_hash *cracked_hashes, int n_hashed) {
-	// TODO (Person B)
-	return NULL;
+// PERSON B: faster lookups
+//
+// The baseline compared a freshly computed hash against EVERY target
+// by first turning it into a 32-char hex string and then scanning all
+// n_hashed targets one by one (O(n_hashed) per password/alg). That
+// scan is the real bottleneck once data3's 5.2M passwords x 4 algs are
+// in play.
+//
+// This replaces that with:
+//   1. convert each target hash from hex text to KEEP raw bytes ONCE,
+//      at load time, keeping its original index into cracked_hashes[]
+//   2. sort those entries by their raw bytes
+//   3. look each computed hash up with binary search -> O(log n_hashed)
+//
+// Threads only READ the sorted array (built once, before any thread
+// starts), so no locking is needed inside lookup_hash.
+// ============================================================
+
+// Convert one hex character ('0'-'9','a'-'f') to its 0-15 value.
+static int hex_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return 0; // inputs are well-formed lowercase hex, so this is unreachable
 }
 
-// TODO (Person B): given a raw hash (KEEP bytes, straight from fn[i]()),
-//      return the matching original_index, or -1 if no match.
-//      This is what worker threads (Person A's crack_chunk) will call
-//      instead of the old linear scan over cracked_hashes[].
+// qsort comparator: order two entries by their KEEP raw bytes.
+// memcmp gives a total order over the fixed-length byte arrays, which is
+// exactly what binary search needs.
+static int entry_cmp(const void *a, const void *b) {
+    const struct hash_entry *ea = (const struct hash_entry *)a;
+    const struct hash_entry *eb = (const struct hash_entry *)b;
+    return memcmp(ea->bytes, eb->bytes, KEEP);
+}
+
+// Build the sorted lookup array once, right after cracked_hashes[] is loaded.
+struct hash_entry *build_lookup_structure(struct cracked_hash *cracked_hashes, int n_hashed) {
+    struct hash_entry *lookup = malloc(n_hashed * sizeof(struct hash_entry));
+    assert(lookup != NULL);
+
+    for (int i = 0; i < n_hashed; i++) {
+        // Each target is 2*KEEP hex chars; fold every pair into one byte.
+        for (int j = 0; j < KEEP; j++) {
+            int hi = hex_val(cracked_hashes[i].hash[2*j]);
+            int lo = hex_val(cracked_hashes[i].hash[2*j + 1]);
+            lookup[i].bytes[j] = (unsigned char)((hi << 4) | lo);
+        }
+        lookup[i].original_index = i; // remember where this came from
+    }
+
+    // Sort by raw bytes so lookup_hash can binary search.
+    qsort(lookup, n_hashed, sizeof(struct hash_entry), entry_cmp);
+    return lookup;
+}
+
+// Binary search the sorted array for a computed raw hash (KEEP bytes,
+// straight from fn[i]()). Returns the matching original index into
+// cracked_hashes[], or -1 if no target matches. Read-only: safe to call
+// from every worker thread at once.
 int lookup_hash(struct hash_entry *lookup, int n_hashed, unsigned char *raw_hash) {
-	// TODO (Person B)
-	return -1;
+    int lo = 0, hi = n_hashed - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        int c = memcmp(raw_hash, lookup[mid].bytes, KEEP);
+        if (c == 0)
+            return lookup[mid].original_index;
+        else if (c < 0)
+            hi = mid - 1;
+        else
+            lo = mid + 1;
+    }
+    return -1;
 }
 
 // ============================================================
@@ -98,23 +152,35 @@ char **load_passwords(char *password_list, int *count) {
 struct thread_args {
 	char **passwords;             // from Person C's load_passwords()
 	int start_idx, end_idx;       // this thread's slice (exclusive end)
-	struct hash_entry *lookup;    // from Person B's build_lookup_structure()
+	struct hash_entry *lookup;    // from build_lookup_structure() (Person B)
 	int n_hashed;
 	struct cracked_hash *local_results; // this thread's PRIVATE results, size n_hashed
 };
 
-// TODO (Person A): worker function run by each thread.
-//      - loop password index from start_idx to end_idx
-//      - for each password, for each of the 4 algorithms:
-//          compute raw_hash = fn[i](password, strlen(password))
-//          idx = lookup_hash(args->lookup, args->n_hashed, raw_hash)
-//          if idx != -1 and args->local_results[idx].password == NULL:
-//              record password + alg into args->local_results[idx]
-//          free(raw_hash)
-//      - write ONLY into args->local_results — never into a shared array,
-//        and never lock anything here; that's the point of thread-local results
+// Worker function run by each thread. Processes only its assigned chunk
+// (start_idx to end_idx) and writes matches ONLY into its own local_results —
+// never into a shared array, and no locking needed because of that.
 void *crack_chunk(void *arg) {
-	// TODO (Person A)
+	struct thread_args *a = (struct thread_args *) arg;
+	unsigned char *raw_hash;
+
+	for (int idx = a->start_idx; idx < a->end_idx; idx++) {
+		char *password = a->passwords[idx];
+
+		for (int alg = 0; alg < n_algs; alg++) {
+			raw_hash = fn[alg]((unsigned char *) password, strlen(password));
+
+			// Person B's O(log n) binary search over the raw target bytes,
+			// replacing the old per-password hex conversion + linear scan.
+			int j = lookup_hash(a->lookup, a->n_hashed, raw_hash);
+			if (j != -1 && a->local_results[j].password == NULL) {
+				// first (earliest) password in THIS chunk to match hash j wins
+				a->local_results[j].password = strdup(password);
+				a->local_results[j].alg = algs[alg];
+			}
+			free(raw_hash);
+		}
+	}
 	return NULL;
 }
 
@@ -147,35 +213,100 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
 	// ============================================================
 	// PERSON B: build the fast lookup structure, once, here
 	// ============================================================
-	// TODO (Person B): struct hash_entry *lookup = build_lookup_structure(cracked_hashes, n_hashed);
+	struct hash_entry *lookup = build_lookup_structure(cracked_hashes, n_hashed);
 
 	// ============================================================
-	// PERSON C: load all passwords into memory, once, here
+	// TEMP (Person A testing only) — load passwords into memory here.
+	// Delete this block and replace with Person C's version once ready:
+	//     int n_passwords;
+	//     char **passwords = load_passwords(password_list, &n_passwords);
 	// ============================================================
-	// TODO (Person C): int n_passwords; char **passwords = load_passwords(password_list, &n_passwords);
+	int n_passwords = 0;
+	int capacity = 1024;
+	char **passwords = (char **) malloc(capacity * sizeof(char *));
+	assert(passwords != NULL);
+	{
+		char buf[256];
+		fp = fopen(password_list, "r");
+		assert(fp != NULL);
+		while (fscanf(fp, "%s", buf) == 1) {
+			if (n_passwords == capacity) {
+				capacity *= 2;
+				passwords = (char **) realloc(passwords, capacity * sizeof(char *));
+				assert(passwords != NULL);
+			}
+			passwords[n_passwords++] = strdup(buf);
+		}
+		fclose(fp);
+	}
 
 	// ============================================================
 	// PERSON A: decide thread count, split passwords into chunks,
 	// allocate each thread's private results, create + join threads
 	// ============================================================
-	// TODO (Person A): pthread_t threads[MAX_THREADS];
-	// TODO (Person A): struct thread_args args[MAX_THREADS];
-	// TODO (Person A): compute how many threads to use and each one's
-	//      [start_idx, end_idx) range over the `passwords` array from Person C
-	// TODO (Person A): for each thread: allocate args[i].local_results
-	//      (size n_hashed, all passwords/algs NULL), fill in the rest of
-	//      args[i], then pthread_create(&threads[i], NULL, crack_chunk, &args[i]);
-	// TODO (Person A): for each thread: pthread_join(threads[i], NULL);
+	int nthreads = MAX_THREADS;
+	if (n_passwords < nthreads)
+		nthreads = (n_passwords > 0) ? n_passwords : 1;
+
+	pthread_t threads[MAX_THREADS];
+	struct thread_args args[MAX_THREADS];
+
+	int base = n_passwords / nthreads;
+	int remainder = n_passwords % nthreads;
+	int start = 0;
+	for (int t = 0; t < nthreads; t++) {
+		int count = base + (t < remainder ? 1 : 0);
+
+		args[t].passwords = passwords;
+		args[t].start_idx = start;
+		args[t].end_idx = start + count;
+		args[t].lookup = lookup;
+		args[t].n_hashed = n_hashed;
+		args[t].local_results = (struct cracked_hash *) malloc(n_hashed * sizeof(struct cracked_hash));
+		assert(args[t].local_results != NULL);
+		for (int j = 0; j < n_hashed; j++) {
+			args[t].local_results[j].password = NULL;
+			args[t].local_results[j].alg = NULL;
+		}
+
+		start += count;
+		pthread_create(&threads[t], NULL, crack_chunk, &args[t]);
+	}
+
+	for (int t = 0; t < nthreads; t++)
+		pthread_join(threads[t], NULL);
 
 	// ============================================================
-	// PERSON A: merge — for each hash, keep the match from whichever
-	// thread owns the EARLIEST chunk (lower start_idx) that found one.
-	// This is what preserves "first match in the password list wins"
-	// even though threads don't finish in file order.
+	// PERSON A: merge — threads were created in ascending start_idx
+	// order, so scanning args[0..nthreads) in that same order and
+	// taking the FIRST non-NULL match per hash preserves "earliest
+	// password in the original list wins," regardless of which
+	// thread actually finished first.
 	// ============================================================
-	// TODO (Person A): for j in 0..n_hashed: walk args[0..nthreads) in
-	//      thread/chunk order (not finish order) and take the first
-	//      non-NULL local_results[j] you find; copy it into cracked_hashes[j]
+	for (int j = 0; j < n_hashed; j++) {
+		for (int t = 0; t < nthreads; t++) {
+			if (args[t].local_results[j].password != NULL) {
+				cracked_hashes[j].password = args[t].local_results[j].password;
+				cracked_hashes[j].alg = args[t].local_results[j].alg;
+				break;
+			}
+		}
+	}
+
+	// free every local_results string EXCEPT the ones that won the merge
+	// (those are now owned by cracked_hashes[] and freed in the final cleanup below)
+	for (int t = 0; t < nthreads; t++) {
+		for (int j = 0; j < n_hashed; j++) {
+			if (args[t].local_results[j].password != NULL
+			    && args[t].local_results[j].password != cracked_hashes[j].password)
+				free(args[t].local_results[j].password);
+		}
+		free(args[t].local_results);
+	}
+
+	for (int i = 0; i < n_passwords; i++)
+		free(passwords[i]);
+	free(passwords);
 
 	// print results (unchanged)
 	fp = fopen(output, "w");
@@ -189,7 +320,7 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
 	fclose(fp);
 
 	// release stuff
-	// TODO (Person B): free the lookup structure
+	free(lookup);
 	// TODO (Person C): free the passwords array
 	// TODO (Person A): free each thread's local_results array
 	for(int i=0; i < n_hashed; i++)
