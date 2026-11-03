@@ -126,13 +126,85 @@ int lookup_hash(struct hash_entry *lookup, int n_hashed, unsigned char *raw_hash
 // This is what lets Person A hand out chunks by index instead of
 // fighting over a shared file pointer across threads.
 // ============================================================
-// TODO (Person C): read password_list fully into memory (e.g. an array
-//      of char*, one per line) and return it, with *count set to the
-//      number of passwords read.
+// Read all passwords into memory in one bulk read and index in-place
 char **load_passwords(char *password_list, int *count) {
-	// TODO (Person C)
-	*count = 0;
-	return NULL;
+	// Open file in binary mode
+	FILE *fp = fopen(password_list, "rb");
+	if (!fp) {
+		*count = 0;
+		return NULL;
+	}
+
+	// Get total file size
+	fseek(fp, 0, SEEK_END);
+	long file_size = ftell(fp);
+	fseek(fp, 0, SEEK_SET);
+
+	// Handle empty file
+	if (file_size <= 0) {
+		fclose(fp);
+		*count = 0;
+		return NULL;
+	}
+
+	// Allocate buffer and read entire file at once
+	char *buffer = (char *) malloc(file_size + 2);
+	assert(buffer != NULL);
+
+	size_t bytes_read = fread(buffer, 1, file_size, fp);
+	fclose(fp);
+	buffer[bytes_read] = '\0';
+
+	// Count newlines/spaces to estimate password count
+	int estimated_passwords = 0;
+	for (size_t i = 0; i < bytes_read; i++) {
+		if (buffer[i] == '\n' || buffer[i] == ' ')
+			estimated_passwords++;
+	}
+	estimated_passwords += 2;
+
+	// Store buffer at mem[0], passwords array starts at mem[1]
+	void **mem = (void **) malloc(sizeof(void *) + ((size_t) estimated_passwords * sizeof(char *)));
+	assert(mem != NULL);
+	mem[0] = buffer;
+	char **passwords = (char **) (&mem[1]);
+
+	// Split buffer into null-terminated strings
+	int n = 0;
+	char *p = buffer;
+	char *end = buffer + bytes_read;
+
+	while (p < end) {
+		// Skip whitespace/delimiters
+		while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n'))
+			p++;
+		if (p >= end)
+			break;
+
+		// Mark password start
+		char *start = p;
+		while (p < end && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n')
+			p++;
+
+		// Null-terminate current password
+		if (p < end) {
+			*p = '\0';
+			p++;
+		}
+		passwords[n++] = start;
+	}
+
+	*count = n;
+	return passwords;
+}
+
+// Free both the contiguous buffer and the pointer array
+void free_passwords(char **passwords) {
+	if (passwords != NULL) {
+		void **mem = ((void **) passwords) - 1;
+		free(mem[0]); // free file buffer
+		free(mem);    // free pointer array
+	}
 }
 
 // Person C also owns, separately from this file:
@@ -216,29 +288,10 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
 	struct hash_entry *lookup = build_lookup_structure(cracked_hashes, n_hashed);
 
 	// ============================================================
-	// TEMP (Person A testing only) — load passwords into memory here.
-	// Delete this block and replace with Person C's version once ready:
-	//     int n_passwords;
-	//     char **passwords = load_passwords(password_list, &n_passwords);
+	// PERSON C: load all passwords into memory
 	// ============================================================
-	int n_passwords = 0;
-	int capacity = 1024;
-	char **passwords = (char **) malloc(capacity * sizeof(char *));
-	assert(passwords != NULL);
-	{
-		char buf[256];
-		fp = fopen(password_list, "r");
-		assert(fp != NULL);
-		while (fscanf(fp, "%s", buf) == 1) {
-			if (n_passwords == capacity) {
-				capacity *= 2;
-				passwords = (char **) realloc(passwords, capacity * sizeof(char *));
-				assert(passwords != NULL);
-			}
-			passwords[n_passwords++] = strdup(buf);
-		}
-		fclose(fp);
-	}
+	int n_passwords;
+	char **passwords = load_passwords(password_list, &n_passwords);
 
 	// ============================================================
 	// PERSON A: decide thread count, split passwords into chunks,
@@ -304,10 +357,6 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
 		free(args[t].local_results);
 	}
 
-	for (int i = 0; i < n_passwords; i++)
-		free(passwords[i]);
-	free(passwords);
-
 	// print results (unchanged)
 	fp = fopen(output, "w");
 	assert(fp != NULL);
@@ -321,7 +370,7 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
 
 	// release stuff
 	free(lookup);
-	// TODO (Person C): free the passwords array
+	free_passwords(passwords);
 	// TODO (Person A): free each thread's local_results array
 	for(int i=0; i < n_hashed; i++)
 		free(cracked_hashes[i].password);
