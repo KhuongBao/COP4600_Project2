@@ -1,12 +1,15 @@
-# Group 25
-# Group members:
-#  - Bao Khuong U62783072
-#  - Sharon Joseph 
-#  - Juan Hermida  
-#  This program accelerates cryptographic password cracking across MD5, SHA1, SHA256, and SHA512. It optimizes the
-#  	baseline using multithreaded work chunking (Person A), an O(log N) raw-byte binary search lookup table (Person B), 
-#	and zero-copy bulk file I/O with in-place tokenization (Person C).
-#
+/*
+Group 25
+Group members:
+ - Bao Khuong U62783072
+ - Sharon Joseph 
+ - Juan Hermida  
+ 
+Description: 
+This program accelerates cryptographic password cracking across MD5, SHA1, SHA256, and SHA512. It optimizes the
+  	baseline using multithreaded work chunking (Person A), an O(log N) raw-byte binary search lookup table (Person B), 
+	and zero-copy bulk file I/O with in-place tokenization (Person C).
+*/
 
 #include <stdio.h>
 #include <string.h>
