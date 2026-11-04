@@ -2,8 +2,8 @@
 Group 25
 Group members:
  - Bao Khuong U62783072
- - Sharon Joseph 
- - Juan Hermida  
+ - Sharon Joseph U50424825
+ - Juan Hermida  U98148272
  
 Description: 
 This program accelerates cryptographic password cracking across MD5, SHA1, SHA256, and SHA512. It optimizes the
@@ -32,9 +32,6 @@ int n_algs = 4;
 hashing fn[4] = {calculate_md5, calculate_sha1, calculate_sha256, calculate_sha512};
 char *algs[4] = {"MD5", "SHA1", "SHA256", "SHA512"};
 
-// Kept from the original — still useful if you compare hex strings anywhere,
-// but Person B's byte-based lookup below is meant to replace the need for
-// converting every computed hash to hex just to compare it.
 int compare_hashes(char *a, char *b) {
 	for(int i=0; i < 2*KEEP; i++)
 		if(a[i] != b[i])
@@ -380,10 +377,10 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
 	}
 	fclose(fp);
 
-	// release stuff
+	// release everything
 	free(lookup);
 	free_passwords(passwords);
-	// TODO (Person A): free each thread's local_results array
+	// free each thread's local_results array
 	for(int i=0; i < n_hashed; i++)
 		free(cracked_hashes[i].password);
 	free(cracked_hashes);
